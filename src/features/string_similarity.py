@@ -1,4 +1,15 @@
+
+from rapidfuzz.distance import Levenshtein
+
+
 def jaccard_similarity(tokens_a, tokens_b):
+    """
+    Calculate Jaccard similarity between two token collections.
+
+    Returns:
+        float: value between 0.0 and 1.0
+    """
+
     set_a = set(tokens_a)
     set_b = set(tokens_b)
 
@@ -10,30 +21,28 @@ def jaccard_similarity(tokens_a, tokens_b):
 
     return len(intersection) / len(union)
 
+
 def levenshtein_similarity(text_a, text_b):
+    """
+    Calculate normalized Levenshtein similarity using RapidFuzz.
+
+    Returns:
+        float: value between 0.0 and 1.0
+
+    Behavior is kept compatible with the previous implementation:
+        - identical strings -> 1.0
+        - either empty string -> 0.0
+        - otherwise -> normalized similarity
+    """
+
     if text_a == text_b:
         return 1.0
 
     if not text_a or not text_b:
         return 0.0
 
-    previous_row = list(range(len(text_b) + 1))
+    return Levenshtein.normalized_similarity(
+        str(text_a),
+        str(text_b)
+    )
 
-    for i, char_a in enumerate(text_a, start=1):
-        current_row = [i]
-
-        for j, char_b in enumerate(text_b, start=1):
-            insertion = current_row[j - 1] + 1
-            deletion = previous_row[j] + 1
-            substitution = previous_row[j - 1] + (char_a != char_b)
-
-            current_row.append(
-                min(insertion, deletion, substitution)
-            )
-
-        previous_row = current_row
-
-    distance = previous_row[-1]
-    max_length = max(len(text_a), len(text_b))
-
-    return 1 - (distance / max_length)

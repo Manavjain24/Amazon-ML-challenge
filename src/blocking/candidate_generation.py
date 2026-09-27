@@ -1,5 +1,12 @@
 
 from collections import defaultdict
+import re
+import unicodedata
+
+try:
+    from unidecode import unidecode
+except ImportError:
+    unidecode = None
 
 from src.preprocessing.normalization import normalize_name
 from src.preprocessing.tokenizer import tokenize_name, tokenize_address
@@ -9,27 +16,22 @@ from src.preprocessing.tokenizer import tokenize_name, tokenize_address
 # CONFIGURATION
 # ============================================================
 
-# Maximum number of useful name tokens used for blocking.
 MAX_NAME_TOKENS = 5
-
-# Maximum number of useful address tokens used for blocking.
 MAX_ADDRESS_TOKENS = 5
 
-# Prefix length used for token-prefix blocking.
 TOKEN_PREFIX_LENGTH = 3
+
+# Transliteration blocking is intentionally limited.
+#
+# We do NOT replace the original Unicode representation.
+# These are additional candidate-generation keys only.
+TRANSLIT_TOKEN_PREFIX_LENGTH = 3
+SKELETON_PREFIX_LENGTH = 2
 
 
 # ============================================================
 # COMMON / LOW-INFORMATION TOKENS
 # ============================================================
-
-# These tokens are common across huge numbers of businesses.
-# Using them as blocking keys can create enormous candidate
-# blocks and destroy the benefit of blocking.
-#
-# IMPORTANT:
-# These are only ignored for token-based blocking.
-# They are NOT removed from the underlying normalized data.
 
 COMMON_NAME_TOKENS = {
     "private",
@@ -57,6 +59,7 @@ COMMON_NAME_TOKENS = {
     "global",
     "india",
 }
+
 
 COMMON_ADDRESS_TOKENS = {
     "road",
@@ -101,11 +104,11 @@ COMMON_ADDRESS_TOKENS = {
 
 def _is_useful_name_token(token):
     """
-    Decide whether a name token is useful for blocking.
+    Return True when a name token contains useful business
+    identity information.
 
-    The token is kept in the normalized/tokenized data, but
-    common generic business/legal words are not used as
-    blocking keys.
+    Generic legal/business words are excluded from blocking
+    keys, but remain untouched in the original data.
     """
 
     if not token:
@@ -124,14 +127,8 @@ def _is_useful_name_token(token):
 
 def _is_useful_address_token(token):
     """
-    Decide whether an address token is useful for blocking.
-
-    Generic address words are ignored because they can create
-    very large blocks.
-
-    Pure numeric tokens are retained separately because things
-    like postal codes, building numbers, plot numbers, etc.
-    can be highly discriminative.
+    Return True when an address token is potentially useful
+    for blocking.
     """
 
     if not token:
@@ -150,10 +147,7 @@ def _is_useful_address_token(token):
 
 def _select_name_tokens(tokens):
     """
-    Select a bounded number of informative name tokens.
-
-    We preserve token order but skip generic business/legal
-    terms.
+    Select up to MAX_NAME_TOKENS informative name tokens.
     """
 
     selected = []
@@ -174,13 +168,10 @@ def _select_name_tokens(tokens):
 
 def _select_address_tokens(tokens):
     """
-    Select a bounded number of informative address tokens.
+    Select up to MAX_ADDRESS_TOKENS useful address tokens.
 
-    We retain both:
-        - informative textual tokens
-        - useful numeric tokens
-
-    This is intentionally bounded to prevent candidate explosion.
+    Numeric tokens are retained because PIN codes, house
+    numbers, plot numbers, etc. can be highly discriminative.
     """
 
     selected = []
@@ -192,11 +183,9 @@ def _select_address_tokens(tokens):
 
         token_lower = token.lower().strip()
 
-        # Keep numeric tokens if they contain useful information.
         if token_lower.isdigit():
 
-            # Ignore extremely short generic numeric values.
-            # Two or more digits are generally more useful.
+            # Avoid single-digit noise.
             if len(token_lower) < 2:
                 continue
 
@@ -218,6 +207,166 @@ def _select_address_tokens(tokens):
 
 
 # ============================================================
+# TRANSLITERATION HELPERS
+# ============================================================
+
+def _romanize(text):
+    """
+    Produce a rough Latin/roman representation of Unicode text.
+
+    This is deliberately used ONLY for blocking.
+
+    The original Unicode text remains the canonical value used
+    by the rest of the matching pipeline.
+
+    If Unidecode is not installed, return an empty string so
+    the existing Unicode blocker continues to work unchanged.
+    """
+
+    if not text:
+        return ""
+
+    if unidecode is None:
+        return ""
+
+    try:
+        value = unidecode(text)
+    except Exception:
+        return ""
+
+    value = value.lower()
+
+    # Keep only ASCII letters and digits.
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+
+    # Collapse whitespace.
+    value = re.sub(r"\s+", " ", value).strip()
+
+    return value
+
+
+def _consonant_skeleton(text):
+    """
+    Create a coarse consonant representation of romanized text.
+
+    Example:
+
+        "sun"  -> "sn"
+        "सन"   -> roughly "sn"
+
+    This is intentionally coarse.
+
+    It is NOT used as a similarity score.
+    It is only an additional blocking key to bridge
+    different writing systems.
+    """
+
+    if not text:
+        return ""
+
+    romanized = _romanize(text)
+
+    if not romanized:
+        return ""
+
+    skeleton_tokens = []
+
+    for token in romanized.split():
+
+        # Keep digits intact.
+        if token.isdigit():
+            skeleton_tokens.append(token)
+            continue
+
+        consonants = "".join(
+            char
+            for char in token
+            if char.isalpha()
+            and char not in "aeiou"
+        )
+
+        if consonants:
+            skeleton_tokens.append(consonants)
+
+    return " ".join(skeleton_tokens)
+
+
+def _transliteration_variants(token):
+    """
+    Generate conservative blocking variants for one token.
+
+    Variants:
+
+        1. Full romanized token
+        2. Romanized prefix
+        3. Consonant skeleton
+        4. Consonant skeleton prefix
+
+    These are ADDITIONAL blocking keys.
+
+    The original Unicode token is always handled separately.
+    """
+
+    variants = set()
+
+    if not token:
+        return variants
+
+    romanized = _romanize(token)
+
+    if romanized:
+
+        # Usually romanization of one token stays one token,
+        # but take the first component if punctuation causes
+        # multiple pieces.
+        roman_tokens = romanized.split()
+
+        for roman_token in roman_tokens:
+
+            if not roman_token:
+                continue
+
+            variants.add(
+                ("FULL", roman_token)
+            )
+
+            if len(roman_token) >= TRANSLIT_TOKEN_PREFIX_LENGTH:
+
+                variants.add(
+                    (
+                        "PREFIX",
+                        roman_token[:TRANSLIT_TOKEN_PREFIX_LENGTH]
+                    )
+                )
+
+    skeleton = _consonant_skeleton(token)
+
+    if skeleton:
+
+        skeleton_tokens = skeleton.split()
+
+        for skeleton_token in skeleton_tokens:
+
+            if not skeleton_token:
+                continue
+
+            variants.add(
+                ("SKELETON", skeleton_token)
+            )
+
+            if len(skeleton_token) >= SKELETON_PREFIX_LENGTH:
+
+                variants.add(
+                    (
+                        "SKELETON_PREFIX",
+                        skeleton_token[:SKELETON_PREFIX_LENGTH]
+                    )
+                )
+
+    return variants
+
+
+# ============================================================
 # BLOCKING KEY GENERATION
 # ============================================================
 
@@ -225,9 +374,7 @@ def create_block_keys(country, business_name, business_address):
     """
     Generate multiple blocking keys for a record.
 
-    Blocking is intentionally multi-strategy.
-
-    Existing strategies are preserved for compatibility:
+    Existing Unicode strategies:
 
         NAME_PREFIX
         NAME_TOKEN
@@ -235,23 +382,17 @@ def create_block_keys(country, business_name, business_address):
         ADDRESS_TOKEN
         ADDRESS_TOKEN_PREFIX
 
-    Improvements:
+    Additional multilingual name strategies:
 
-        1. Name blocking is no longer restricted to the first
-           name token.
+        NAME_TRANSLIT
+        NAME_TRANSLIT_PREFIX
+        NAME_SKELETON
+        NAME_SKELETON_PREFIX
 
-        2. Address blocking is no longer restricted to the first
-           non-numeric address token.
+    The transliteration/skeleton strategies are intended only
+    to bridge different writing systems.
 
-        3. Multiple informative tokens are used.
-
-        4. Generic business/legal/address tokens are excluded
-           from token-based blocking.
-
-        5. Useful numeric address tokens are retained.
-
-    Returns:
-        set[str]
+    Public function signature is unchanged.
     """
 
     keys = set()
@@ -267,7 +408,7 @@ def create_block_keys(country, business_name, business_address):
     ).strip()
 
     # ========================================================
-    # 1. NAME PREFIX
+    # 1. ORIGINAL UNICODE NAME PREFIX
     # ========================================================
 
     if normalized_name:
@@ -281,7 +422,7 @@ def create_block_keys(country, business_name, business_address):
             )
 
     # ========================================================
-    # 2. NAME TOKEN BLOCKING
+    # 2. ORIGINAL UNICODE NAME TOKEN BLOCKING
     # ========================================================
 
     name_tokens = tokenize_name(
@@ -294,18 +435,58 @@ def create_block_keys(country, business_name, business_address):
 
     for token in useful_name_tokens:
 
-        # Full token key.
+        # --------------------------------------------
+        # Exact Unicode token
+        # --------------------------------------------
+
         keys.add(
             f"NAME_TOKEN|{country}|{token}"
         )
 
-        # Short token-prefix key.
+        # --------------------------------------------
+        # Unicode token prefix
+        # --------------------------------------------
+
         if len(token) >= TOKEN_PREFIX_LENGTH:
 
             keys.add(
                 f"NAME_TOKEN_PREFIX|{country}|"
                 f"{token[:TOKEN_PREFIX_LENGTH]}"
             )
+
+        # ====================================================
+        # MULTILINGUAL / TRANSLITERATION BLOCKING
+        # ====================================================
+
+        translit_variants = _transliteration_variants(
+            token
+        )
+
+        for variant_type, variant in translit_variants:
+
+            if variant_type == "FULL":
+
+                keys.add(
+                    f"NAME_TRANSLIT|{country}|{variant}"
+                )
+
+            elif variant_type == "PREFIX":
+
+                keys.add(
+                    f"NAME_TRANSLIT_PREFIX|{country}|{variant}"
+                )
+
+            elif variant_type == "SKELETON":
+
+                keys.add(
+                    f"NAME_SKELETON|{country}|{variant}"
+                )
+
+            elif variant_type == "SKELETON_PREFIX":
+
+                keys.add(
+                    f"NAME_SKELETON_PREFIX|{country}|{variant}"
+                )
 
     # ========================================================
     # 3. ADDRESS TOKEN BLOCKING
@@ -321,20 +502,12 @@ def create_block_keys(country, business_name, business_address):
 
     for token in useful_address_tokens:
 
-        # Full address token.
+        # Exact address token.
         keys.add(
             f"ADDRESS_TOKEN|{country}|{token}"
         )
 
-        # Prefix is useful for spelling variations such as:
-        #
-        # Wayne
-        # Wanye
-        #
-        # Both can potentially produce:
-        #
-        # Way
-        #
+        # Address token prefix.
         if len(token) >= TOKEN_PREFIX_LENGTH:
 
             keys.add(
@@ -351,21 +524,11 @@ def create_block_keys(country, business_name, business_address):
 
 def build_block_index(source_df):
     """
-    Build a multi-key blocking index.
+    Build the multi-key blocking index.
 
-    Example:
+    The DataFrame index is preserved as the candidate ID.
 
-        {
-            "NAME_PREFIX|US|wi": [10, 25, 100],
-            "NAME_TOKEN|US|wilson": [10, 25],
-            "NAME_TOKEN_PREFIX|US|wil": [10, 25],
-            "ADDRESS_TOKEN|US|texas": [10, 90]
-        }
-
-    Each record can belong to multiple blocks.
-
-    The DataFrame index is preserved as the candidate ID so
-    existing downstream code remains compatible.
+    Public interface is unchanged.
     """
 
     block_index = defaultdict(list)
@@ -396,8 +559,7 @@ def get_candidates(source_record, block_index):
 
     Duplicate candidates are removed.
 
-    The return type remains a list so existing downstream
-    pipeline code does not need to change.
+    Public interface is unchanged.
     """
 
     keys = create_block_keys(
