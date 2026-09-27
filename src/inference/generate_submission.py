@@ -329,20 +329,20 @@ def get_candidate_ids(
     source_record,
 ):
     """
-    Retrieve blocking candidates.
-
-    Each candidate receives a hit count representing how many
-    independent blocking keys produced that candidate.
-
-    Candidates with more blocking-key agreement are ranked first.
+    Retrieve candidates from blocking.
 
     Returns:
 
-        scoring_candidate_ids:
-            IDs that will receive expensive feature extraction.
+        scoring_candidate_ids
+            Small shortlist used for expensive feature extraction
+            and model scoring.
 
-        all_candidate_ids:
-            Complete candidate set returned by blocking.
+        all_candidate_ids
+            All candidates found by blocking, used for the
+            candidate-pairs output.
+
+    Candidate ranking is based on the number of blocking keys
+    that independently matched the candidate.
     """
 
     keys = create_block_keys(
@@ -351,9 +351,16 @@ def get_candidate_ids(
         source_record["business_address"],
     )
 
-    candidate_hits = {}
+    if not keys:
+        return [], []
 
     cursor = conn.cursor()
+
+    candidate_hits = {}
+
+    # ========================================================
+    # COLLECT BLOCKING CANDIDATES
+    # ========================================================
 
     for key in keys:
 
@@ -379,12 +386,24 @@ def get_candidate_ids(
             )
 
     if not candidate_hits:
-
         return [], []
 
-    # --------------------------------------------------------
-    # Rank by blocking agreement.
-    # --------------------------------------------------------
+    # ========================================================
+    # ALL CANDIDATES
+    # ========================================================
+
+    all_candidate_ids = list(
+        candidate_hits.keys()
+    )
+
+    # ========================================================
+    # RANK CANDIDATES
+    # ========================================================
+    #
+    # More independent blocking-key hits = stronger candidate.
+    #
+    # We do NOT run expensive string similarity here.
+    # ========================================================
 
     ranked_candidates = sorted(
         candidate_hits.items(),
@@ -394,21 +413,11 @@ def get_candidate_ids(
         ),
     )
 
-    # --------------------------------------------------------
-    # Full candidate set.
-    #
-    # This is preserved for candidate_pairs.tsv.
-    # --------------------------------------------------------
+    # ========================================================
+    # EXPENSIVE SCORING SHORTLIST
+    # ========================================================
 
-    all_candidate_ids = [
-        entity_id
-        for entity_id, hit_count
-        in ranked_candidates
-    ]
-
-    # --------------------------------------------------------
-    # Only strongest candidates reach expensive scoring.
-    # --------------------------------------------------------
+    MAX_EXPENSIVE_CANDIDATES = 30
 
     scoring_candidate_ids = [
         entity_id
@@ -422,7 +431,6 @@ def get_candidate_ids(
         scoring_candidate_ids,
         all_candidate_ids,
     )
-
 
 # ============================================================
 # FETCH RECORDS
@@ -495,6 +503,140 @@ def fetch_records(
 # SCORE CANDIDATES
 # ============================================================
 
+def _cheap_candidate_score(
+    source1_record,
+    candidate_record,
+):
+    """
+    Cheap deterministic score used ONLY to rank candidates
+    before expensive feature extraction.
+
+    This is not the final match score.
+
+    Higher score = stronger basic agreement.
+    """
+
+    score = 0
+
+    name1 = (
+        str(source1_record["business_name"])
+        .strip()
+        .lower()
+    )
+
+    name2 = (
+        str(candidate_record["business_name"])
+        .strip()
+        .lower()
+    )
+
+    address1 = (
+        str(source1_record["business_address"])
+        .strip()
+        .lower()
+    )
+
+    address2 = (
+        str(candidate_record["business_address"])
+        .strip()
+        .lower()
+    )
+
+    country1 = (
+        str(source1_record["country"])
+        .strip()
+        .lower()
+    )
+
+    country2 = (
+        str(candidate_record["country"])
+        .strip()
+        .lower()
+    )
+
+    # --------------------------------------------------------
+    # Country agreement
+    # --------------------------------------------------------
+
+    if country1 and country1 == country2:
+        score += 5
+
+    # --------------------------------------------------------
+    # Exact name agreement
+    # --------------------------------------------------------
+
+    if name1 and name1 == name2:
+        score += 100
+
+    # --------------------------------------------------------
+    # Exact address agreement
+    # --------------------------------------------------------
+
+    if address1 and address1 == address2:
+        score += 80
+
+    # --------------------------------------------------------
+    # Name token overlap using cheap Python sets.
+    # --------------------------------------------------------
+
+    name_tokens1 = set(
+        name1.split()
+    )
+
+    name_tokens2 = set(
+        name2.split()
+    )
+
+    if name_tokens1 and name_tokens2:
+
+        overlap = len(
+            name_tokens1 & name_tokens2
+        )
+
+        score += min(
+            overlap * 10,
+            50,
+        )
+
+    # --------------------------------------------------------
+    # Address token overlap.
+    # --------------------------------------------------------
+
+    address_tokens1 = set(
+        address1.split()
+    )
+
+    address_tokens2 = set(
+        address2.split()
+    )
+
+    if address_tokens1 and address_tokens2:
+
+        overlap = len(
+            address_tokens1 & address_tokens2
+        )
+
+        score += min(
+            overlap * 3,
+            30,
+        )
+
+    # --------------------------------------------------------
+    # Prefix agreement.
+    #
+    # Cheap signal for names that are similar.
+    # --------------------------------------------------------
+
+    if (
+        len(name1) >= 3
+        and len(name2) >= 3
+        and name1[:3] == name2[:3]
+    ):
+        score += 15
+
+    return score
+
+
 def score_candidates(
     model,
     feature_columns,
@@ -502,23 +644,80 @@ def score_candidates(
     candidate_records,
 ):
     """
-    Extract features for the shortlisted candidates and score
-    them in one model prediction call.
+    Two-stage candidate scoring.
 
-    Feature extraction remains pair-by-pair, but model inference
-    is batched to avoid thousands of predict_proba() calls.
+    Stage 1:
+        Cheap deterministic ranking.
+
+    Stage 2:
+        Expensive feature extraction + trained model
+        on only the strongest candidates.
+
+    This is required for practical inference on an
+    8 GB RAM / lower-end machine.
     """
 
     if not candidate_records:
-
         return []
 
-    candidate_ids = []
-    feature_rows = []
+    # ========================================================
+    # STAGE 1
+    # CHEAP CANDIDATE RANKING
+    # ========================================================
+
+    ranked_candidates = []
 
     for candidate_id, candidate_record in (
         candidate_records.items()
     ):
+
+        cheap_score = _cheap_candidate_score(
+            source1_record,
+            candidate_record,
+        )
+
+        ranked_candidates.append(
+            (
+                cheap_score,
+                candidate_id,
+                candidate_record,
+            )
+        )
+
+    ranked_candidates.sort(
+        key=lambda item: (
+            -item[0],
+            item[1],
+        )
+    )
+
+    # ========================================================
+    # STAGE 2
+    # EXPENSIVE FEATURE EXTRACTION
+    # ========================================================
+
+    # Only the strongest candidates reach:
+    #
+    # normalize
+    # tokenize
+    # Jaccard
+    # Levenshtein
+    # transliteration
+    # skeleton
+    # etc.
+
+    expensive_candidates = ranked_candidates[
+        :30
+    ]
+
+    candidate_ids = []
+    feature_rows = []
+
+    for (
+        cheap_score,
+        candidate_id,
+        candidate_record,
+    ) in expensive_candidates:
 
         features = extract_pair_features(
             source1_record,
@@ -538,10 +737,12 @@ def score_candidates(
             feature_vector
         )
 
-    # --------------------------------------------------------
-    # DataFrame preserves feature names and avoids the
-    # sklearn "X does not have valid feature names" warning.
-    # --------------------------------------------------------
+    if not feature_rows:
+        return []
+
+    # ========================================================
+    # BATCH MODEL PREDICTION
+    # ========================================================
 
     feature_df = pd.DataFrame(
         feature_rows,
@@ -568,10 +769,6 @@ def score_candidates(
                 )
             )
 
-    # --------------------------------------------------------
-    # Highest-confidence matches first.
-    # --------------------------------------------------------
-
     matches.sort(
         key=lambda x: x[1],
         reverse=True,
@@ -588,15 +785,18 @@ def write_output_row(
     matching_writer,
     candidate_writer,
     source1_id,
-    candidate_ids,
+    scoring_candidate_ids,
     matched_ids,
 ):
     """
-    Write exactly one row for each Source 1 entity.
+    Write one row for each Source 1 entity.
+
+    candidate_pairs.tsv contains only the candidates that
+    actually reach model inference.
     """
 
     candidate_list = ",".join(
-        sorted(candidate_ids)
+        sorted(scoring_candidate_ids)
     )
 
     matched_list = ",".join(
@@ -616,7 +816,6 @@ def write_output_row(
             matched_list,
         ]
     )
-
 
 # ============================================================
 # PROCESS TEST SOURCE 1
@@ -807,7 +1006,7 @@ def process_test_source1(
                 matching_writer,
                 candidate_writer,
                 source1_id,
-                all_candidate_ids,
+                scoring_candidate_ids,
                 matched_ids,
             )
 

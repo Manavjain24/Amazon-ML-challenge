@@ -41,8 +41,8 @@ logs/
 
 # Project-specific generated artifacts
 *.blipdownload
-output/
-outputs/
+
+
 artifacts/
 results/
 
