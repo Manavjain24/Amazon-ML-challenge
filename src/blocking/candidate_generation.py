@@ -1,4 +1,4 @@
-```python
+
 from collections import defaultdict
 
 from src.preprocessing.normalization import normalize_name
@@ -415,4 +415,4 @@ def get_candidates(source_record, block_index):
             candidates.add(idx)
 
     return list(candidates)
-```
+
